@@ -1,0 +1,223 @@
+---
+title: "15-Minute City - Analysis"
+author: "Sean Connelly"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+# Load libraries
+pacman::p_load(tidyverse, janitor, tidycensus, sf, tmap, patchwork, hrbrthemes, here, extrafont)
+
+#Options, call stored Census API key, load fonts
+options(scipen = 1000, stringsAsFactors = F, tigris_use_cache = TRUE)
+
+# Set working directory
+setwd(here::here())
+
+```
+
+# Import Data
+
+```{r import data}
+
+# ACS
+lu_chi_tracts <- st_read("../Data/Census/Chi_Tracts.shp", crs = 26971)
+lu_chi_tract_centroids <- st_read("../Data/Census/Chi_Tract_Centroids.shp", crs = 26971)
+lu_chi_commareas <- st_read("../Data/Census/Chi_CommAreas.shp", crs = 26971)
+
+acs_chi_tracts <- read_csv("../Data/Census/Chi_Tracts_Attributes.csv")
+
+# Isochrones
+isochrones <- st_read("../Data/Isochrones/isochrones.shp", crs = 26971) %>% 
+  filter(cost_level == 15)
+
+# OSM
+osm_amenities <- st_read("../Data/OSM/amenities.shp", crs = 26971) %>%
+  rename("amenity_type" = amnty_t) %>% 
+  mutate(amenity_type = factor(amenity_type, 
+                               levels = c("Learn", "Self-Develop/Connect", "Take Care", "Exercise",
+                                          "Play Outdoors", "Shop Local", "Get Supplies/Eat Well")))
+
+```
+
+### Create Measures
+
+````{r clean osm amenities}
+
+# Tract Area
+lu_chi_tracts <- lu_chi_tracts %>% 
+  mutate(area = st_area(lu_chi_tracts))
+
+# Race data
+tract_race <- acs_chi_tracts %>% 
+  filter(str_detect(variable, "^B02001_00(1|2|3|4|5|6|7|8)")) %>% 
+  select(GEOID, NAME, label, estimate_2018) %>% 
+  mutate(GEOID = as.character(GEOID),
+         label = stringi::stri_extract_last_regex(label, "[^;]+") %>% str_trim()) %>%
+  mutate(label = case_when(label == "White alone" ~
+                             "White",
+                           label == "Black or African American alone" ~
+                             "Black",
+                           label == "American Indian and Alaska Native alone" ~
+                             "AIAN",
+                           label == "Asian alone" ~
+                             "Asian",
+                           label == "Native Hawaiian and Other Pacific Islander alone" ~
+                             "NHOPI",
+                           label == "Two or more races" ~
+                             "Multiple",
+                           label == "Some other race alone" ~
+                             "Other",
+                           TRUE ~ label)) %>% 
+  pivot_wider(names_from = label, values_from = estimate_2018) %>% 
+  mutate(nbhd_type = case_when(Black / Total > 0.5 ~ "Majority Black",
+                               White / Total > 0.5 ~ "Majority White",
+                               TRUE ~ "Other"))
+
+# Amenities
+osm_by_iso_raw <- st_join(isochrones, osm_amenities) %>%
+  st_drop_geometry() 
+
+osm_by_iso_counts <- osm_by_iso_raw %>%
+  group_by(GEOID, amenity_type) %>% 
+  summarize(amenity_n = n())
+
+# Final
+final_data <- lu_chi_tracts %>%
+  st_drop_geometry() %>% 
+  left_join(tract_race, by = "GEOID") %>% 
+  left_join(osm_by_iso_counts, by = "GEOID") %>% 
+  complete(GEOID, amenity_type) %>% 
+  left_join(lu_chi_tracts %>% dplyr::select(GEOID), by = "GEOID") %>% 
+  st_as_sf(., crs = 26971) %>% 
+  filter(!is.na(amenity_type)) %>% 
+  mutate(area = units::drop_units(area) / 1000, 
+         amenity_score = amenity_n / (Total / area)) %>% 
+  group_by(amenity_type) %>% 
+  mutate(amenity_percentile = ntile(amenity_score, 100)) %>% 
+  ungroup()
+
+```
+
+### Maps
+
+```{r maps}
+
+# Figure 1- Race
+lu_chi_tracts %>% 
+  left_join(tract_race, by = "GEOID") %>% 
+  ggplot() +
+    geom_sf(aes(fill = nbhd_type)) +
+    labs(title = "Figure 1 - Racial Demographics by Census Tract",
+         caption = "Data: ACS") +
+    scale_fill_ipsum() +
+    theme_ipsum(grid = FALSE) +
+    theme(axis.line = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank())
+
+tract_race %>% tabyl(nbhd_type) %>% adorn_totals("row")
+
+# Figure 2 - Build Isochrones (QGIS)
+# Figure 3 - OSM Amenities (QGIS)
+
+# Figure 4 - Amenity Scores
+ggplot() +
+  geom_sf(data = final_data, aes(fill = amenity_score)) +
+  facet_wrap(~ amenity_type, nrow = 2) +
+  labs(title = "Figure 4 - Raw Amenity Scores in Chicago",
+       subtitle = "By Amenity Type",
+       caption = "Data: OSM, ACS") + 
+  theme_ipsum(grid = FALSE) +
+  theme(legend.position = "top",
+        axis.line = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+# Percentiles
+ggplot() +
+  geom_sf(data = final_data %>% 
+            filter(amenity_type %in% c("Learn", "Shop Local", "Get Supplies/Eat Well")),
+          aes(fill = amenity_percentile)) +
+  facet_wrap(~ amenity_type, nrow = 2) +
+  labs(title = "Figure 5 - Percentile Amenity Scores in Chicago",
+       subtitle = "By Amenity Type",
+       caption = "Data: OSM, ACS") +
+  scale_fill_gradient2(low = "#D18975",
+                       high = "#8FD175",
+                       midpoint = 50) +
+  theme_ipsum(grid = FALSE) +
+  theme(legend.position = "top",
+        axis.line = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks=element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+# # Crosstab
+# final_data  %>% 
+#   st_drop_geometry() %>% 
+#   mutate(amenity_quant = ntile(amenity_score, 5)) %>% 
+#   tabyl(amenity_quant, nbhd_type) %>% 
+#   adorn_totals("row") %>%
+#   adorn_percentages("col") %>%
+#   adorn_pct_formatting() %>%
+#   adorn_ns() %>%
+#   adorn_title("combined") %>% knitr::kable()
+
+# Map
+# Example Census Tracts
+plot_map <- ggplot() +
+  geom_sf(data = final_data, fill = "white", alpha = 0.2) +
+  geom_sf(data = final_data %>% filter(GEOID == "17031220601"),
+          fill = "#D18975") +
+  geom_sf(data = final_data %>% filter(GEOID == "17031310900"),
+          fill = "#8FD175") +
+  geom_sf(data = final_data %>% filter(GEOID == "17031062200"),
+          fill = "#75B8D1") +
+    geom_sf(data = final_data %>% filter(GEOID == "17031843600"),
+          fill = "#3F2D54") +
+  labs(title = "Figure 6 -  Selected Tracts Map",
+       caption = "Data: OSM, ACS") +
+  theme_ipsum(grid = FALSE) +
+  theme(legend.position = "top",
+        axis.line = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+# Plot of scores
+plot_scores <- ggplot(data = final_data %>% 
+         filter(GEOID %in% c("17031220601", "17031310900",
+                             "17031843600", "17031062200"),
+                amenity_type %in% c("Get Supplies/Eat Well",
+                                    "Shop Local")) %>% 
+         mutate(NAME = str_remove(NAME, ", Cook County, Illinois")),
+       aes(amenity_type, amenity_percentile, fill = NAME)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Figure 7 - Percentile Amenity Scores in Selected Tracts",
+       caption = "Data: OSM, ACS") +
+  scale_fill_ipsum() +
+  theme_ipsum() +
+  theme(legend.position = "right")
+
+# Together
+dev.off()
+plot_map + plot_scores
+
+```
+

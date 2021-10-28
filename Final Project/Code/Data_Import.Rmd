@@ -1,0 +1,560 @@
+---
+title: "15-Minute City - Data Import"
+author: "Sean Connelly"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+# Load libraries
+pacman::p_load(tidyverse, janitor, tidycensus, sf, osmdata, dodgr, here, extrafont)
+
+#Options, call stored Census API key, load fonts
+options(scipen = 1000, stringsAsFactors = F, tigris_use_cache = TRUE)
+invisible(Sys.getenv("CENSUS_API_KEY"))
+
+# Set working directory
+setwd(here::here())
+
+# Increase memory limit
+memory.limit(16000)
+
+```
+
+# ACS 5-Year Estimates from Census 
+
+### Import Data
+
+```{r import ACS}
+
+# List of variables from ACS 5-Year estimates
+ref_vars_18 <- load_variables(2018, "acs5", cache = TRUE)
+
+ref_tables_18 <- ref_vars_18 %>% 
+  mutate(table = str_extract(name, "^.*(?=_)")) %>% 
+  group_by(table, concept) %>% 
+  summarize(n())
+  
+# Grab variables in race, income tables
+vars <- ref_vars_18 %>% 
+  filter(str_detect(name, pattern = "(^B02001_*)|(^B19001_*)"))
+  
+# ACS end years
+years <- list(2010, 2018)
+
+# ===============
+# Chicago reference spatial data
+# ===============
+
+# Tracts, Community Areas, Citywide
+lu_chi_tracts <- st_read("../Data/Base/Chi_Tracts_2010.geojson")
+lu_chi_commareas <- st_read("../Data/Base/Chi_CommAreas.geojson") 
+lu_citywide <- st_read("../Data/Base/Chi_Boundary.geojson")
+
+# Build link from comm areas to tracts
+link_commareas_tract <- lu_chi_commareas %>% 
+  left_join(., lu_chi_tracts %>% st_drop_geometry(), by = "commarea_n")
+
+# ===============
+# Chicago - Tracts
+# ===============
+
+# Grab census data for tracts located within Cook County
+acs_raw_cook <- map(years,
+                    ~ get_acs(
+                        geography = "tract",
+                        variables = vars %>% pull(name),
+                        year = .x,
+                        survey = "acs5",
+                        state = "IL", 
+                        county = "Cook",
+                        geometry = FALSE)) %>%
+  map2(years, ~mutate(.x, id = .y))
+
+# Restrict to City of Chicago tracts
+acs_chi_tracts <- reduce(acs_raw_cook, rbind) %>% 
+  semi_join(., lu_chi_tracts %>% st_drop_geometry(), by = "GEOID") %>% 
+  rename("year" = id)
+
+# ===============
+# Chicago - Citywide
+# ===============
+
+# Grab census data for City of Chicago
+acs_raw_citywide <- map(years,
+                        ~ get_acs(
+                          geography = "place",
+                          variables = vars %>% pull(name),
+                          year = .x,
+                          survey = "acs5",
+                          state = "IL",
+                          geometry = FALSE)) %>%
+  map2(years, ~mutate(.x, id = .y))
+
+# Restrict to City of Chicago
+acs_citywide <- reduce(acs_raw_citywide, rbind) %>% 
+  filter(NAME == "Chicago city, Illinois") %>% 
+  rename("year" = id)
+
+```
+
+### Clean and Tidy
+
+```{r clean ACS}
+
+# ===============
+# Chicago - Tracts
+# ===============
+
+# Join variable labels, create table field, remove sub-tables
+acs_chi_tracts <- left_join(acs_chi_tracts, vars, 
+                            by = c("variable" = "name")) %>%
+  mutate(sheet_name = gsub( "_.*$", "", variable),
+         label = gsub("!!", "; ", label)) %>% 
+  filter(grepl("\\d$", sheet_name)) %>%
+  pivot_wider(names_from = year, values_from = c(estimate, moe)) %>% 
+  mutate(change = `estimate_2018` - `estimate_2010`,
+         pct_change = change/`estimate_2010`) %>% 
+  left_join(., 
+            link_commareas_tract %>% 
+              st_drop_geometry() %>% 
+              select(community, GEOID), 
+            by = "GEOID") %>% 
+  select(sheet_name, concept, community, GEOID, NAME, 
+         variable, label, starts_with("estimate"), starts_with("moe"),
+         change, pct_change)
+
+# ===============
+# Chicago - Citywide
+# ===============
+
+# Join variable labels, create table field, remove sub-tables
+acs_citywide <- left_join(acs_citywide, vars, 
+                          by = c("variable" = "name")) %>%
+  mutate(sheet_name = gsub( "_.*$", "", variable),
+         label = gsub("!!", "; ", label)) %>% 
+  filter(grepl("\\d$", sheet_name)) %>%
+  pivot_wider(names_from = year, values_from = c(estimate, moe)) %>% 
+  mutate(change = `estimate_2018` - `estimate_2010`,
+         pct_change = change/`estimate_2010`) %>% 
+  select(sheet_name, concept, GEOID, NAME, 
+         variable, label, starts_with("estimate"), starts_with("moe"),
+         change, pct_change)
+
+# ===============
+# Summarize to Community Areas
+# ===============
+
+# Join comm area spatial to tract-level ACS data, summarize up to comm areas
+acs_chi_commareas <- acs_chi_tracts %>% 
+  select(-GEOID, -NAME, -change, -pct_change) %>% 
+  group_by(community, sheet_name, concept, variable, label) %>% 
+  summarize(estimate_2010 = sum(estimate_2010),
+            estimate_2018 = sum(estimate_2018),
+            moe_2010 = moe_sum(moe_2010, estimate_2010),
+            moe_2018 = moe_sum(moe_2018, estimate_2018)) %>%
+  ungroup() %>% 
+  mutate(change = `estimate_2018` - `estimate_2010`,
+         pct_change = change/`estimate_2010`) %>% 
+  select(sheet_name, concept, community, 
+         variable, label, starts_with("estimate"), starts_with("moe"),
+         change, pct_change)
+
+```
+
+### Export
+
+```{r export clean ACS data}
+
+# Illinois state plane
+lu_citywide <- lu_citywide %>% st_transform(crs = 26971)
+lu_chi_commareas <- lu_chi_tracts %>% st_transform(crs = 26971)
+lu_chi_tracts <- lu_chi_tracts %>% st_transform(crs = 26971)
+
+# Tract centroids
+lu_chi_tract_centroids <- lu_chi_tracts %>% 
+  st_centroid()
+
+# Write to shapefile
+st_write(lu_chi_tract_centroids, "../Data/Census/Chi_Tract_Centroids.shp", delete_dsn = TRUE)
+st_write(lu_chi_tracts, "../Data/Census/Chi_Tracts.shp", delete_dsn = TRUE)
+st_write(lu_chi_commareas, "../Data/Census/Chi_CommAreas.shp", delete_dsn = TRUE)
+st_write(lu_citywide, "../Data/Census/Chi_Citywide.shp", delete_dsn = TRUE)
+
+# Write to attributes to CSV
+write_csv(acs_chi_tracts, "../Data/Census/Chi_Tracts_Attributes.csv")
+write_csv(acs_chi_commareas, "../Data/Census/Chi_CommAreas_Attributes.csv")
+write_csv(acs_citywide, "../Data/Census/Chi_Citywide_Attributes.csv")
+
+# Note: worth removing data stored in memory at this step
+rm(list = ls())
+
+```
+
+# Street Network
+
+### Import Data
+
+```{r import street network}
+
+# Chicago street network
+streets_raw <- opq("Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "highway") %>%
+  osmdata_sf() %>% 
+  pluck("osm_lines") %>%
+  select(osm_id, highway, name, lanes, maxspeed, geometry) %>%
+  filter(is.na(name) | (!str_detect(name, "Expressway"))) %>% 
+  mutate(highway = "pedestrian")
+
+# Transform to Illinois State Plane East 1201 Feet
+streets_raw <- st_transform(streets_raw, crs = 26971)
+                            
+# Weight by mode, remove streets_raw
+graph <- weight_streetnet(streets_raw, wt_profile = "foot")
+
+rm(streets_raw)
+
+```
+
+### Clean and Tidy
+
+```{r clean street network}
+
+# Find nodes closest to centroid of tracts, need temporary sf object
+graph_sf <- st_as_sf(graph, coords = c("from_lon", "from_lat"), crs = 26971)
+
+lu_chi_tract_centroids <- st_read("../Data/Census/Chi_Tract_Centroids.shp", crs = 26971)
+
+nodes_sf <- graph_sf %>% 
+  filter(row_number() %in% st_nearest_feature(lu_chi_tract_centroids, graph_sf))
+
+# Join Census tract info
+tract_nums <- lu_chi_tract_centroids %>% 
+  st_drop_geometry() %>% 
+  mutate(match_node = st_nearest_feature(nodes_sf, lu_chi_tract_centroids)) %>% 
+  select(match_node, GEOID)
+
+nodes_sf <- nodes_sf %>% 
+  mutate(match_node = row_number()) %>% 
+  left_join(tract_nums, by = "match_node")
+
+```
+
+### Export
+
+```{r export street network}
+
+# Export for QGIS calculations
+st_write(streets_raw, "../Data/Isochrones/streets_raw.shp", delete_dsn = TRUE)
+st_write(nodes_sf, "../Data/Isochrones/nodes_sf.shp", delete_dsn = TRUE)
+
+# Note: worth removing data stored in memory at this step
+rm(list = ls())
+
+```
+
+# Isochrones
+
+### Import Data
+
+```{r import amenities}
+
+# Import nodes
+nodes_sf <- st_read("../Data/Isochrones/nodes_sf.shp", crs = 26971) %>% 
+  arrange(mtch_nd)
+
+# Import QGIS Files
+isochrones <- list.files("../Data/Isochrones/Individual",
+                        pattern = "\\.shp$", 
+                        full.names = TRUE) %>% 
+  set_names %>% 
+  map_df(~st_read(.x, crs = 26971), .id = "file_name") %>% 
+  as_tibble() %>% 
+  st_as_sf(., crs = 26971)
+
+# Rename and clean
+isochrones <- isochrones %>% 
+  select(-id) %>% 
+  mutate(cost_level = cost_level / 60,
+         node_id = as.numeric(str_extract(file_name, "\\d+")) + 1)
+
+# Join node and tract info
+isochrones <- isochrones %>% 
+  left_join(.,
+            nodes_sf %>% 
+              st_drop_geometry() %>% 
+              select(mtch_nd, GEOID,commr_n),
+            by = c("node_id" = "mtch_nd")) %>% 
+  select(GEOID, cost_level, geometry)
+
+```
+
+### Export
+
+```{r export isochrones}
+
+# Write to shapefile
+st_write(isochrones, "../Data/Isochrones/isochrones.shp", delete_dsn = TRUE)
+
+# Note: worth removing data stored in memory at this step
+rm(list = ls())
+
+```
+
+# OSM Amenities
+
+### Import Data
+
+```{r import amenities}
+
+# From CityLab (https://www.citylab.com/environment/2020/02/paris-election-anne-hidalgo-city-planning-walks-stores-parks/606325/)
+# Paris en Commun’s 15-minute city concept. From the top, clockwise, the headings read: Learn, Work, Share and Re-Use, Get Supplies, Take the Air, Self-Develop and Connect, Look After Yourself, Get Around, Spend, and Eat Well. (Paris en Commun)
+
+# Grab data from OpenStreetMap (https://wiki.openstreetmap.org/wiki/Map_Features#Amenity)
+# Work (N/A)
+# Share and Re-use (N/A)
+# Get Around (N/A)
+
+# Learn
+osm_temp_school <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "school") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "school")
+
+# Self-Develop and Connect
+osm_temp_library <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "library") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "library")
+
+osm_temp_community_centre <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "community_centre") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "community_centre")
+
+osm_temp_theatre <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "theatre") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "theatre")
+
+# Look After Yourself
+osm_temp_hospital <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "hospital") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "hospital")
+
+osm_temp_clinic <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "clinic") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "clinic")
+
+osm_temp_pharmacy <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "pharmacy") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "pharmacy")
+
+# Take the Air
+osm_temp_park <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "leisure", value = "park") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = leisure, name) %>% 
+  filter(amenity == "park")
+
+osm_temp_playground <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "leisure", value = "playground") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = leisure, name) %>% 
+  filter(amenity == "playground")
+
+# Exercise (Look After Yourself Pt 2)
+osm_temp_fitness_centre <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "leisure", value = "fitness_centre") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = leisure, name) %>% 
+  filter(amenity == "fitness_centre")
+
+osm_temp_sports_centre <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "leisure", value = "sports_centre") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = leisure, name) %>% 
+  filter(amenity == "sports_centre")
+
+# Spend
+osm_temp_marketplace <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "marketplace") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "marketplace")
+
+osm_temp_restaurant <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "restaurant") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "restaurant")
+
+osm_temp_bar <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "bar") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "bar")
+
+osm_temp_cafe <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "amenity", value = "cafe") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select(amenity, name) %>% 
+  filter(amenity == "cafe")
+
+osm_temp_clothes <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "clothes") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "clothes")   
+
+osm_temp_department_store <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "department_store") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "department_store") 
+
+osm_temp_variety_store <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "variety_store") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "variety_store") 
+
+# get Supplies/Eat Well
+osm_temp_supermarket <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "supermarket") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "supermarket") 
+
+osm_temp_convenience <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "convenience") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "convenience") 
+
+osm_temp_greengrocer <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "greengrocer") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "greengrocer") 
+
+osm_temp_bakery <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "bakery") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "bakery") 
+
+osm_temp_deli <- opq(bbox = "Chicago, Illinois, USA") %>%
+  add_osm_feature(key = "shop", value = "deli") %>%
+  osmdata_sf() %>% 
+  unique_osmdata() %>% 
+  pluck("osm_points") %>% 
+  select("amenity" = shop, name) %>% 
+  filter(amenity == "deli")
+
+```
+
+### Clean and Tidy
+
+````{r clean osm amenities}
+
+# Bind together, fix projection
+osm_amenities <- mget(ls(pattern = "^osm_temp_")) %>%
+  bind_rows() %>% 
+  as_tibble() %>% 
+  st_as_sf(., crs = 4326) %>% 
+  st_transform(crs = 26971)
+
+rm(list = (ls(pattern = "^osm_temp_")))
+
+# Create groupings
+osm_amenities <- osm_amenities %>% 
+  mutate(amenity_type = case_when(amenity == "school" ~
+                                    "Learn",
+                                  amenity %in% c("library", "community_centre", "theatre") ~
+                                    "Self-Develop/Connect",
+                                  amenity %in% c("hospital", "clinic", "pharmacy") ~
+                                    "Take Care",
+                                  amenity %in% c("fitness_centre", "sports_centre") ~
+                                    "Exercise",
+                                  amenity %in% c("park", "playground") ~
+                                    "Play Outdoors",
+                                  amenity %in% c("marketplace", "restaurant", "bar", "cafe",
+                                                 "clothes", "department_store", "variety_store") ~
+                                    "Shop Local",
+                                  amenity %in% c("supermarket", "convenience", "greengrocer", 
+                                                 "bakery", "deli") ~
+                                    "Get Supplies/Eat Well") %>% 
+           factor(., levels = c("Learn", "Self-Develop/Connect", "Take Care", "Exercise",
+                                "Play Outdoors", "Shop Local", "Get Supplies/Eat Well"))) %>% 
+  select(amenity_type, everything())
+
+```
+
+### Export
+
+```{r export osm amenities}
+
+# Write to shapefile
+st_write(osm_amenities, "../Data/OSM/amenities.shp", delete_dsn = TRUE)
+
+rm(list = ls())
+
+```
